@@ -1,17 +1,18 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_pdfview/flutter_pdfview.dart';
-import 'package:camera/camera.dart'; // 🌟 1. 카메라 기능 불러오기
+import 'package:camera/camera.dart';
+import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:google_fonts/google_fonts.dart';
 
-// 🌟 2. 내 폰에 있는 카메라 목록을 저장할 빈 바구니
 List<CameraDescription> cameras = [];
 
-// 🌟 3. 앱 시작 전에 카메라를 먼저 찾도록 main() 함수 수정
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   try {
-    cameras = await availableCameras(); // 폰의 모든 카메라(전면, 후면) 정보 가져오기
+    cameras = await availableCameras();
   } catch (e) {
     print('카메라 에러: $e');
   }
@@ -24,10 +25,13 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Page Turner',
+      debugShowCheckedModeBanner: false, // 오른쪽 위 DEBUG 띠 여부
+      title: 'Wink Page Turner',
       theme: ThemeData(
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
+        // 앱 전체 텍스트에 백악관 폰트와 비슷한 폰트 (Merriweather) 적용
+        textTheme: GoogleFonts.merriweatherTextTheme(), 
       ),
       home: const PdfViewerPage(),
     );
@@ -45,68 +49,108 @@ class _PdfViewerPageState extends State<PdfViewerPage> {
   String? localPath;
   PDFViewController? _pdfViewController;
   int currentPage = 0;
-
-  // 🌟 4. 카메라를 조종할 리모컨 변수 추가
   CameraController? _cameraController;
+  final FaceDetector _faceDetector = FaceDetector(
+    options: FaceDetectorOptions(enableClassification: true, enableTracking: true),
+  );
+
+  bool _isDetecting = false;
+  String eyeStatus = "AI 인식 중...";
+  DateTime _lastTurnTime = DateTime.now();
 
   @override
   void initState() {
     super.initState();
-    // PDF 준비하기
     fromAsset('assets/sample.pdf', 'sample.pdf').then((f) {
-      setState(() {
-        localPath = f.path;
-      });
+      if (mounted) setState(() => localPath = f.path);
     });
-
-    // 🌟 5. 전면 카메라 켜기 함수 실행
     _initCamera();
   }
 
-  // 🌟 전면 카메라를 찾아서 세팅하는 함수
   Future<void> _initCamera() async {
     if (cameras.isEmpty) return;
+    CameraDescription? frontCamera = cameras.firstWhere((c) => c.lensDirection == CameraLensDirection.front);
 
-    CameraDescription? frontCamera;
-    for (var camera in cameras) {
-      if (camera.lensDirection == CameraLensDirection.front) {
-        frontCamera = camera; // 셀카용 전면 카메라 찾기
-        break;
+    _cameraController = CameraController(
+      frontCamera,
+      ResolutionPreset.low,
+      enableAudio: false,
+      imageFormatGroup: Platform.isAndroid ? ImageFormatGroup.nv21 : ImageFormatGroup.bgra8888,
+    );
+
+    await _cameraController!.initialize();
+    if (!mounted) return;
+    setState(() {});
+
+    _cameraController!.startImageStream((image) {
+      if (_isDetecting) return;
+      _isDetecting = true;
+      _processCameraImage(image, frontCamera);
+    });
+  }
+
+  Future<void> _processCameraImage(CameraImage image, CameraDescription camera) async {
+    try {
+      final inputImage = _prepareInputImage(image, camera);
+      final List<Face> faces = await _faceDetector.processImage(inputImage);
+
+      if (faces.isNotEmpty) {
+        final face = faces.first;
+        final left = face.leftEyeOpenProbability ?? 1.0;
+        final right = face.rightEyeOpenProbability ?? 1.0;
+
+        setState(() {
+          eyeStatus = "L: ${(left * 100).toInt()}% | R: ${(right * 100).toInt()}%";
+        });
+
+        //  왼쪽 눈 윙크 감지 (쿨타임 1.5초)
+        if (left < 0.15 && right > 0.75) {
+          if (DateTime.now().difference(_lastTurnTime).inMilliseconds > 1500) {
+            _turnPage(true);
+            _lastTurnTime = DateTime.now();
+          }
+        }
       }
-    }
-
-    if (frontCamera != null) {
-      _cameraController = CameraController(
-        frontCamera,
-        ResolutionPreset.low, // 얼굴 인식용이라 저화질(low)로 설정하여 속도 높이기
-        enableAudio: false,   // 소리 녹음은 안 함
-      );
-
-      await _cameraController!.initialize();
-      if (mounted) {
-        setState(() {}); // 화면 새로고침해서 카메라 보여주기
-      }
+    } catch (e) {
+      print(e);
+    } finally {
+      _isDetecting = false;
     }
   }
 
-  Future<File> fromAsset(String asset, String filename) async {
-    try {
-      var data = await rootBundle.load(asset);
-      var bytes = data.buffer.asUint8List();
-      var dir = Directory.systemTemp;
-      File file = File("${dir.path}/$filename");
-
-      await file.writeAsBytes(bytes, flush: true);
-      return file;
-    } catch (e) {
-      throw Exception("파일을 처리하는 중 오류가 났어요: $e");
+  void _turnPage(bool next) {
+    if (_pdfViewController != null) {
+      _pdfViewController!.setPage(next ? currentPage + 1 : currentPage - 1);
     }
+  }
+
+  InputImage _prepareInputImage(CameraImage image, CameraDescription camera) {
+    final WriteBuffer allBytes = WriteBuffer();
+    for (final Plane plane in image.planes) {
+      allBytes.putUint8List(plane.bytes);
+    }
+    final bytes = allBytes.done().buffer.asUint8List();
+    final inputImageData = InputImageMetadata(
+      size: Size(image.width.toDouble(), image.height.toDouble()),
+      rotation: InputImageRotationValue.fromRawValue(camera.sensorOrientation) ?? InputImageRotation.rotation0deg,
+      format: InputImageFormatValue.fromRawValue(image.format.raw) ?? InputImageFormat.nv21,
+      bytesPerRow: image.planes[0].bytesPerRow,
+    );
+    return InputImage.fromBytes(bytes: bytes, metadata: inputImageData);
+  }
+
+  Future<File> fromAsset(String asset, String filename) async {
+    var data = await rootBundle.load(asset);
+    var bytes = data.buffer.asUint8List();
+    File file = File("${Directory.systemTemp.path}/$filename");
+    await file.writeAsBytes(bytes, flush: true);
+    return file;
   }
 
   @override
   void dispose() {
-    // 🌟 6. 앱을 끌 때 카메라도 안전하게 꺼주기
     _cameraController?.dispose();
+    _faceDetector.close();
     super.dispose();
   }
 
@@ -114,73 +158,78 @@ class _PdfViewerPageState extends State<PdfViewerPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text("나의 악보"),
+        title: Text(
+          "AI Wink Page Turner",
+          style: GoogleFonts.merriweather(fontWeight: FontWeight.bold),
+        ),
         backgroundColor: Colors.blue[100],
       ),
-      // 🌟 7. 화면을 겹치기 위해 Stack 사용 (바닥엔 PDF, 그 위엔 카메라)
       body: Stack(
         children: [
-          // [1층] 바닥: PDF 뷰어
+          // 1. PDF 악보 화면
           Positioned.fill(
             child: localPath != null
                 ? PDFView(
                     filePath: localPath,
-                    enableSwipe: true,
                     swipeHorizontal: true,
-                    autoSpacing: false,
-                    pageFling: true,
-                    backgroundColor: Colors.grey,
-                    onViewCreated: (PDFViewController vc) {
-                      _pdfViewController = vc;
-                    },
-                    onPageChanged: (int? page, int? total) {
-                      setState(() {
-                        currentPage = page ?? 0;
-                      });
-                    },
+                    onViewCreated: (vc) => _pdfViewController = vc,
+                    onPageChanged: (p, t) => setState(() => currentPage = p ?? 0),
                   )
                 : const Center(child: CircularProgressIndicator()),
           ),
-
-          // [2층] 공중: 카메라 화면 (오른쪽 위에 작게 띄우기)
+          
+          // 2. 카메라 미리보기 (오른쪽 위)
           if (_cameraController != null && _cameraController!.value.isInitialized)
             Positioned(
-              top: 20,
+              top: 20, 
               right: 20,
               child: Container(
-                width: 100,
-                height: 130,
+                width: 90, 
+                height: 110,
                 decoration: BoxDecoration(
-                  border: Border.all(color: Colors.blueAccent, width: 3),
-                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.white, width: 2), 
+                  borderRadius: BorderRadius.circular(10)
                 ),
                 child: ClipRRect(
-                  borderRadius: BorderRadius.circular(7),
-                  child: CameraPreview(_cameraController!), // 카메라 영상이 나오는 곳
+                  borderRadius: BorderRadius.circular(8), 
+                  child: CameraPreview(_cameraController!)
                 ),
               ),
             ),
+            
+          // 3. 눈 상태 표시 텍스트 (반투명)
+          Positioned(
+            top: 20,
+            left: 20,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.black45, // 악보가 비치도록 반투명 배경
+                borderRadius: BorderRadius.circular(15),
+              ),
+              child: Text(
+                eyeStatus,
+                style: const TextStyle(
+                  color: Colors.white, 
+                  fontSize: 14,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          ),
         ],
       ),
-      // 수동 넘기기 버튼 (유지)
+      //  수동 넘기기 버튼
       floatingActionButton: Row(
         mainAxisAlignment: MainAxisAlignment.end,
         children: [
           FloatingActionButton(
-            onPressed: () {
-              if (_pdfViewController != null && currentPage > 0) {
-                _pdfViewController!.setPage(currentPage - 1);
-              }
-            },
+            onPressed: () => _turnPage(false),
             child: const Icon(Icons.arrow_back),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: 8),
           FloatingActionButton(
-            onPressed: () {
-              if (_pdfViewController != null) {
-                _pdfViewController!.setPage(currentPage + 1);
-              }
-            },
+            onPressed: () => _turnPage(true),
             child: const Icon(Icons.arrow_forward),
           ),
         ],
